@@ -4,7 +4,10 @@ This project is a port of my OpenGL particle simulator to WebGPU. OpenGL is pret
 
 > [!Note]
 > how to run:
-> npm install
-> npm i wgpu-matrix dat.gui
-> npm i -D @types/dat.gui @webgpu/types
-> npm run dev
+
+```bash
+npm install
+npm i wgpu-matrix dat.gui
+npm i -D @types/dat.gui @webgpu/types
+npm run dev
+```

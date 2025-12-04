@@ -3,16 +3,11 @@ import { GUI } from 'dat.gui';
 import './style.css'
 import particleWGSL from './particle.wgsl?raw';
 
-const numParticles = 10000;
+const numParticles = 5000;
 const particlePositionOffset = 0;
 const particleColorOffset = 4 * 4;
-const particleInstanceByteSize =
-  3 * 4 + // position
-  1 * 4 + // lifetime
-  4 * 4 + // color
-  3 * 4 + // velocity
-  1 * 4 + // padding
-  0;
+const particleInstanceByteSize = 48;
+const sphDataSize = 32;
 
 
 const canvas = document.querySelector('canvas') as HTMLCanvasElement;
@@ -36,9 +31,7 @@ function configureContext() {
   context.configure({
     device,
     format: presentationFormat,
-    //toneMapping: { mode: simulationParams.toneMappingMode },
   });
-  //hdrFolder.name = getHdrFolderName();
 }
 
 
@@ -47,7 +40,10 @@ const particlesBuffer = device.createBuffer({
   size: numParticles * particleInstanceByteSize,
   usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
 });
-
+const sphDataBuffer = device.createBuffer({
+  size: numParticles * sphDataSize,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+})
 const boxMin = {x: -1.0, y: -1.0, z: -1.0};
 const boxMax = {x: 1.0, y: 1.0, z: 1.0}
 
@@ -88,7 +84,9 @@ function initParticles()
     initData[base + 8] = vx;
     initData[base + 9] = vy;
     initData[base + 10] = vz;
-    initData[base + 11] = 0.0; //pad
+    initData[base + 11] = 0.0; // padding
+
+
     
   }
 
@@ -106,6 +104,39 @@ function initParticles()
   const Encoder = device.createCommandEncoder();
   Encoder.copyBufferToBuffer(staging, 0, particlesBuffer, 0, initData.byteLength);
   device.queue.submit([Encoder.finish()]);
+
+
+  // init sph data
+
+  const sphData = new Float32Array(8 * numParticles);
+  for (let i = 0; i < numParticles; i++)
+  {
+    const base = i * 8;
+    sphData[base] = 1.0 // density
+    sphData[base + 1] = 0.0 // pressure
+    sphData[base + 2] = 0.0 // pad
+    sphData[base + 3] = 0.0 // padd
+    sphData[base + 4] = 0.0 // force x
+    sphData[base + 5] = 0.0 // force y
+    sphData[base + 6] = 0.0 // force z
+    sphData[base + 7] = 0.0 // padd
+  }
+
+  const staging2 = device.createBuffer(
+    {
+      size: sphData.byteLength,
+      usage: GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC,
+      mappedAtCreation: true,
+    }
+  );
+  new Float32Array(staging2.getMappedRange()).set(sphData);
+  staging2.unmap();
+
+  const Encoder2 = device.createCommandEncoder();
+  Encoder2.copyBufferToBuffer(staging2, 0, sphDataBuffer, 0, sphData.byteLength);
+  device.queue.submit([Encoder2.finish()]);
+
+
 }
 
 
@@ -255,17 +286,50 @@ quadVertexBuffer.unmap();
 //////////////////////////////////////////////////////////////////////////////
 // Simulation compute pipeline
 //////////////////////////////////////////////////////////////////////////////
+
+
+
+//constant calculations
+var h = 0.01; // smoothing radius
+var h2 = h * h;
+var h6 = h2 * h2 * h2;
+var h9 = h6 * h2 * h;
+var PI = Math.PI;
+
+var poly6_constant = 315.0 / (64.0 * PI * h9);
+var spiky_constant = -45.0 / (PI * h6);
+
+
 const simulationParams = {
   simulate: true,
   deltaTime: 0.01,
-  bounce: 0.7,
+  bounce: 0.5,
   count: numParticles,
   gravity: -9.8,
-  toneMappingMode: 'standard' as GPUCanvasToneMappingMode,
-  brightnessFactor: 1,
+
+  smoothing_radius: h,
+  smoothing_radius2: h2,
+  mass: 1.0,
+  rest_density: 625,
+  pressure_constant: 1.0,
+  viscosity_constant: 0.0,
+  
+  pad0: 0.0,
+  pad1: 0.0,
+
+  boxMin : [-1,-1,-1],
+  pad2: 0.0,
+  boxMax : [1,1,1],
+  pad3: 0.0,
+
+  // Kernel precomputations
+  poly6_constant: poly6_constant,
+  spiky_constant: spiky_constant,
+  pad4: 0.0,
+  pad5: 0.0,
 };
 
-const simulationUBOBufferSize = 16 * 4; // why do we need 16 floats? whats the size of simulate & tonemappingmode? 1 byte for each?
+const simulationUBOBufferSize = 96; 
 const simulationUBOBuffer = device.createBuffer({
   size: simulationUBOBufferSize,
   usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -278,18 +342,96 @@ gui.add(simulationParams, 'deltaTime', 0.001, 0.05, 0.001);
 gui.add(simulationParams, 'gravity', -30, 0, 30);
 gui.add(simulationParams, 'bounce', 0.0, 1.0, 0.01);
 
+const fSPH = gui.addFolder('SPH');
+fSPH.add(simulationParams, 'mass', 0.001, 10.0, 0.001);
+fSPH.add(simulationParams, 'rest_density', 0.001, 50.0, 0.001);
+fSPH.add(simulationParams, 'pressure_constant', 0.0, 5000.0, 1.0);
+fSPH.add(simulationParams, 'viscosity_constant', 0.0, 1.0, 0.0005);
 
-const computePipeline = device.createComputePipeline({
-  layout: 'auto',
+// smoothing radius affects both smoothing_radius and smoothing_radius2
+fSPH.add(simulationParams, 'smoothing_radius', 0.01, 5.0, 0.01).onChange((h: number) => {
+  simulationParams.smoothing_radius = h;
+  simulationParams.smoothing_radius2 = h * h;
+});
+
+fSPH.add(simulationParams, 'smoothing_radius2').listen(); // read-only display basically
+fSPH.open();
+
+// const fBox = gui.addFolder('Bounds (read-only unless you wire updates)');
+// fBox.add(simulationParams, 'boxMin').listen();
+// fBox.add(simulationParams, 'boxMax').listen();
+// fBox.open();
+
+const fKernel = gui.addFolder('Kernel constants');
+fKernel.add(simulationParams, 'poly6_constant').listen();
+fKernel.add(simulationParams, 'spiky_constant').listen();
+fKernel.open();
+const computeBindGroupLayout = device.createBindGroupLayout({
+  entries: [
+    {
+      binding: 0,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: {
+        type: 'uniform',
+      },
+    },
+    {
+      binding: 1,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: {
+        type: 'storage',
+      },
+    },
+    {
+      binding: 2,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: {
+        type: 'storage',
+      },
+    },
+  ],
+});
+
+const computePipelineLayout = device.createPipelineLayout({
+  bindGroupLayouts: [computeBindGroupLayout],
+});
+
+
+const densityPipeline = device.createComputePipeline({
+  layout: computePipelineLayout,
   compute: {
     module: device.createShaderModule({
       code: particleWGSL,
     }),
-    entryPoint: 'simulate',
+    entryPoint: 'compute_density_pressure',
   },
 });
+
+const forcesPipeline = device.createComputePipeline({
+  layout: computePipelineLayout,
+  compute: {
+    module: device.createShaderModule({
+      code: particleWGSL,
+    }),
+    entryPoint: 'compute_forces',
+  },
+});
+
+const integratePipeline = device.createComputePipeline({
+  layout: computePipelineLayout,
+  compute: {
+    module: device.createShaderModule({
+      code: particleWGSL,
+    }),
+    entryPoint: 'integrate',
+  },
+});
+
+
+
+
 const computeBindGroup = device.createBindGroup({
-  layout: computePipeline.getBindGroupLayout(0),
+  layout: computeBindGroupLayout,
   entries: [
     {
       binding: 0,
@@ -305,6 +447,14 @@ const computeBindGroup = device.createBindGroup({
         size: numParticles * particleInstanceByteSize,
       },
     },
+    {
+      binding: 2,
+      resource: {
+        buffer: sphDataBuffer,
+        offset: 0,
+        size: numParticles * sphDataSize, //size?
+      },
+    }
   ],
 });
 
@@ -313,22 +463,24 @@ const projection = mat4.perspective((2 * Math.PI) / 5, aspect, 1, 100.0);
 const view = mat4.create();
 const mvp = mat4.create();
 
-function frame() {
-
-  
-
-  device.queue.writeBuffer(
+function updateSimParameters()
+{
+ device.queue.writeBuffer(
     simulationUBOBuffer,
     0,
     new Float32Array([
       simulationParams.simulate ? simulationParams.deltaTime : 0.0,
       simulationParams.bounce,
-      0.0,
-      0.0, // pad
-      
-      simulationParams.count,
+      simulationParams.count >>> 0,
       simulationParams.gravity, 
-      0.0, // pad
+      simulationParams.smoothing_radius,
+      simulationParams.smoothing_radius2,
+      simulationParams.mass,
+      simulationParams.rest_density,
+      simulationParams.pressure_constant,
+      simulationParams.viscosity_constant,
+
+      0.0,
       0.0,
 
       boxMin.x,
@@ -340,8 +492,20 @@ function frame() {
       boxMax.y,
       boxMax.z,
       0.0, // pad
+      
+      simulationParams.poly6_constant,
+      simulationParams.spiky_constant,
+
+      0.0,
+      0.0,
     ])
   );
+}
+function frame() {
+
+  updateSimParameters();
+
+ 
 
   mat4.identity(view);
   mat4.translate(view, vec3.fromValues(0, 0, -3), view);
@@ -373,12 +537,26 @@ function frame() {
   renderPassDescriptor.colorAttachments[0].view = swapChainTexture.createView();
 
   const commandEncoder = device.createCommandEncoder();
-  {
-    const passEncoder = commandEncoder.beginComputePass();
-    passEncoder.setPipeline(computePipeline);
-    passEncoder.setBindGroup(0, computeBindGroup);
-    passEncoder.dispatchWorkgroups(Math.ceil(numParticles / 64));
-    passEncoder.end();
+  { 
+
+    // computes densities + pressures
+    const computePass = commandEncoder.beginComputePass();
+    computePass.setPipeline(densityPipeline);
+    computePass.setBindGroup(0, computeBindGroup);
+    computePass.dispatchWorkgroups(Math.ceil(numParticles / 64));
+    
+    // computes forces
+    computePass.setPipeline(forcesPipeline);
+    computePass.setBindGroup(0, computeBindGroup);
+    computePass.dispatchWorkgroups(Math.ceil(numParticles / 64));
+    
+    // integration pass
+    computePass.setPipeline(integratePipeline);
+    computePass.setBindGroup(0, computeBindGroup);
+    computePass.dispatchWorkgroups(Math.ceil(numParticles / 64));
+
+    //end
+    computePass.end();
   }
   {
     const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
@@ -387,7 +565,7 @@ function frame() {
     passEncoder.setVertexBuffer(0, particlesBuffer);
     passEncoder.setVertexBuffer(1, quadVertexBuffer);
     passEncoder.draw(6, numParticles, 0, 0);
-    passEncoder.end();
+    passEncoder.end(); 
   }
 
   device.queue.submit([commandEncoder.finish()]);
